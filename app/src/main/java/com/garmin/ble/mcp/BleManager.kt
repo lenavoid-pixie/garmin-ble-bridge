@@ -1,13 +1,23 @@
 package com.garmin.ble.mcp
 
+import android.annotation.SuppressLint
+import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothGattCallback
 import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
+import android.bluetooth.le.BluetoothLeScanner
+import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanFilter
+import android.bluetooth.le.ScanResult
+import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.os.ParcelUuid
 import android.util.Log
 import java.util.UUID
 
@@ -22,23 +32,83 @@ class BleManager(private val context: Context, private val listener: HrListener)
 
     companion object {
         private const val TAG = "BleManager"
+        // Fallback only — scan is the primary path now (Garmin HR broadcast can use a different address)
         const val GARMIN_ADDR = "E0:48:24:A1:A0:3E"
         private val HR_SERVICE_UUID = UUID.fromString("0000180d-0000-1000-8000-00805f9b34fb")
         private val HR_MEASUREMENT_UUID = UUID.fromString("00002a37-0000-1000-8000-00805f9b34fb")
         private val CCCD_UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+        private const val SCAN_TIMEOUT_MS = 20000L
     }
 
     private var gatt: BluetoothGatt? = null
+    private var scanner: BluetoothLeScanner? = null
+    private var scanning = false
     private val writeQueue = ArrayDeque<() -> Unit>()
     private var writeInProgress = false
+    private val handler = Handler(Looper.getMainLooper())
 
     fun connect() {
         val adapter = (context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
-        val device = adapter.getRemoteDevice(GARMIN_ADDR)
-        gatt = device.connectGatt(context, false, gattCallback)
+        startScan(adapter)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun startScan(adapter: BluetoothAdapter) {
+        scanner = adapter.bluetoothLeScanner
+        if (scanner == null) {
+            listener.onError("Bluetooth scanner unavailable")
+            return
+        }
+        val filters = listOf(
+            ScanFilter.Builder().setServiceUuid(ParcelUuid(HR_SERVICE_UUID)).build()
+        )
+        val settings = ScanSettings.Builder()
+            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .build()
+        scanning = true
+        scanner!!.startScan(filters, settings, scanCallback)
+        handler.postDelayed({
+            if (scanning) {
+                scanning = false
+                try { scanner?.stopScan(scanCallback) } catch (_: Exception) {}
+                Log.d(TAG, "Scan timed out, falling back to hardcoded MAC")
+                connectByAddress(GARMIN_ADDR)
+            }
+        }, SCAN_TIMEOUT_MS)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun connectByAddress(address: String) {
+        try {
+            val adapter = (context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
+            val device = adapter.getRemoteDevice(address)
+            Log.d(TAG, "Direct connect to $address")
+            gatt = device.connectGatt(context, false, gattCallback)
+        } catch (e: Exception) {
+            listener.onError("Connect failed: ${e.message}")
+        }
+    }
+
+    private val scanCallback = object : ScanCallback() {
+        @SuppressLint("MissingPermission")
+        override fun onScanResult(callbackType: Int, result: ScanResult) {
+            if (!scanning) return
+            scanning = false
+            try { scanner?.stopScan(scanCallback) } catch (_: Exception) {}
+            val device = result.device
+            Log.d(TAG, "Found HR device: ${device.address} name=${device.name}")
+            gatt = device.connectGatt(context, false, gattCallback)
+        }
+
+        override fun onScanFailed(errorCode: Int) {
+            scanning = false
+            Log.d(TAG, "Scan failed code=$errorCode, falling back to hardcoded MAC")
+            connectByAddress(GARMIN_ADDR)
+        }
     }
 
     fun disconnect() {
+        try { scanner?.stopScan(scanCallback) } catch (_: Exception) {}
         gatt?.disconnect()
         gatt?.close()
         gatt = null
@@ -83,9 +153,8 @@ class BleManager(private val context: Context, private val listener: HrListener)
                 return
             }
 
-            // Garmin は独自 CCCD への書き込みが先に必要。
-            // handle ベースのリフレクションは新しい Android で動かないため、
-            // 全サービスの CCCD をまとめて有効化する（Garmin 独自のものも含まれる）。
+            // Garmin requires writing to its own CCCD first. Enable notifications on
+            // every characteristic that has a CCCD (covers Garmin's proprietary ones too).
             for (service in gatt.services) {
                 for (char in service.characteristics) {
                     val cccd = char.getDescriptor(CCCD_UUID) ?: continue
@@ -101,7 +170,6 @@ class BleManager(private val context: Context, private val listener: HrListener)
         }
 
         override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
-            // HR CCCD の書き込み完了 = 通知受信の準備完了
             if (descriptor.characteristic?.uuid == HR_MEASUREMENT_UUID) {
                 if (status == BluetoothGatt.GATT_SUCCESS) listener.onConnected()
                 else listener.onError("Failed to enable HR notifications (status=$status)")
@@ -109,7 +177,7 @@ class BleManager(private val context: Context, private val listener: HrListener)
             executeNext()
         }
 
-        // API 33 以上
+        // API 33+
         override fun onCharacteristicChanged(
             gatt: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic,
@@ -118,7 +186,7 @@ class BleManager(private val context: Context, private val listener: HrListener)
             if (characteristic.uuid == HR_MEASUREMENT_UUID) handleHrValue(value)
         }
 
-        // API 32 以下
+        // API 32 and below
         @Deprecated("Deprecated in API 33")
         override fun onCharacteristicChanged(
             gatt: BluetoothGatt,
