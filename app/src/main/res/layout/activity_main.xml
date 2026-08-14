@@ -3,8 +3,8 @@
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:orientation="vertical"
-    android:gravity="center"
-    android:padding="32dp">
+    android:gravity="top|center_horizontal"
+    android:padding="24dp">
 
     <TextView
         android:id="@+id/tvStatus"
@@ -14,7 +14,7 @@
         android:textSize="18sp"
         android:textColor="@android:color/darker_gray"
         android:gravity="center"
-        android:layout_marginBottom="32dp" />
+        android:layout_marginTop="16dp" />
 
     <TextView
         android:id="@+id/tvHr"
@@ -23,7 +23,7 @@
         android:text="-- BPM"
         android:textSize="72sp"
         android:textStyle="bold"
-        android:layout_marginBottom="32dp" />
+        android:layout_marginTop="16dp" />
 
     <TextView
         android:id="@+id/tvWsPort"
@@ -31,7 +31,7 @@
         android:layout_height="wrap_content"
         android:textSize="14sp"
         android:textColor="@android:color/darker_gray"
-        android:layout_marginBottom="8dp" />
+        android:layout_marginTop="8dp" />
 
     <TextView
         android:id="@+id/tvClients"
@@ -39,12 +39,13 @@
         android:layout_height="wrap_content"
         android:text="PC clients: 0"
         android:textSize="16sp"
-        android:layout_marginBottom="40dp" />
+        android:layout_marginTop="4dp" />
 
     <LinearLayout
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:orientation="horizontal">
+        android:orientation="horizontal"
+        android:layout_marginTop="16dp">
 
         <Button
             android:id="@+id/btnStart"
@@ -60,5 +61,25 @@
             android:text="Stop" />
 
     </LinearLayout>
+
+    <ScrollView
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:layout_marginTop="16dp"
+        android:background="#11000000">
+
+        <TextView
+            android:id="@+id/tvLog"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:textSize="11sp"
+            android:fontFamily="monospace"
+            android:textIsSelectable="true"
+            android:textColor="#333333"
+            android:padding="8dp"
+            android:text="" />
+
+    </ScrollView>
 
 </LinearLayout>

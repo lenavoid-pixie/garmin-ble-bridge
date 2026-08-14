@@ -24,6 +24,7 @@ class BleService : Service(), BleManager.HrListener {
     var statusListener: ((String) -> Unit)? = null
     var hrListener: ((Int) -> Unit)? = null
     var clientCountListener: ((Int) -> Unit)? = null
+    var logListener: ((String) -> Unit)? = null
 
     companion object {
         private const val CHANNEL_ID = "garmin_ble_channel"
@@ -34,7 +35,9 @@ class BleService : Service(), BleManager.HrListener {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
-        bleManager = BleManager(this, this)
+        bleManager = BleManager(this, this).also { bm ->
+            bm.logListener = { line -> logListener?.invoke(line) }
+        }
         wsServer = HrWebSocketServer(8765).apply {
             onClientConnected = {
                 clientCount++

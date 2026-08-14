@@ -31,6 +31,7 @@ class MainActivity : AppCompatActivity() {
                 svc.statusListener = { status -> runOnUiThread { binding.tvStatus.text = status } }
                 svc.hrListener = { hr -> runOnUiThread { binding.tvHr.text = "$hr BPM" } }
                 svc.clientCountListener = { count -> runOnUiThread { binding.tvClients.text = "PC clients: $count" } }
+                svc.logListener = { line -> runOnUiThread { appendLog(line) } }
             }
             updateButtons(running = true)
         }
@@ -109,6 +110,15 @@ class MainActivity : AppCompatActivity() {
         ContextCompat.startForegroundService(this, intent)
         bindService(intent, connection, Context.BIND_AUTO_CREATE)
         binding.tvStatus.text = "Connecting..."
+    }
+
+    private fun appendLog(line: String) {
+        val sb = StringBuilder(binding.tvLog.text ?: "")
+        sb.append(line).append('\n')
+        // keep last ~200 lines
+        val lines = sb.toString().split('\n')
+        val trimmed = if (lines.size > 200) lines.takeLast(200) else lines
+        binding.tvLog.text = trimmed.joinToString("\n")
     }
 
     private fun updateButtons(running: Boolean) {
