@@ -89,7 +89,7 @@ class BleManager(private val context: Context, private val listener: HrListener)
         }
     }
 
-    private val scanCallback = object : ScanCallback() {
+    private val scanCallback: ScanCallback = object : ScanCallback() {
         @SuppressLint("MissingPermission")
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             if (!scanning) return
@@ -155,13 +155,17 @@ class BleManager(private val context: Context, private val listener: HrListener)
 
             // Garmin requires writing to its own CCCD first. Enable notifications on
             // every characteristic that has a CCCD (covers Garmin's proprietary ones too).
+            // For the HR measurement char, subscribe to BOTH notification and indication:
+            // Garmin broadcasts often arrive as indications, and a notification-only
+            // subscribe can connect silently but never deliver a value.
             for (service in gatt.services) {
                 for (char in service.characteristics) {
                     val cccd = char.getDescriptor(CCCD_UUID) ?: continue
                     gatt.setCharacteristicNotification(char, true)
+                    val isHr = char.uuid == HR_MEASUREMENT_UUID
                     enqueueWrite {
                         @Suppress("DEPRECATION")
-                        cccd.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                        cccd.value = if (isHr) byteArrayOf(0x03, 0x00) else BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
                         @Suppress("DEPRECATION")
                         gatt.writeDescriptor(cccd)
                     }
