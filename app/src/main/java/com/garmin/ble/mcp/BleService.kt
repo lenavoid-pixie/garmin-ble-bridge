@@ -9,6 +9,9 @@ import android.content.Intent
 import android.os.Binder
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
+import java.net.HttpURLConnection
+import java.net.URL
+import java.util.concurrent.Executors
 
 class BleService : Service(), BleManager.HrListener {
 
@@ -20,6 +23,7 @@ class BleService : Service(), BleManager.HrListener {
     private lateinit var bleManager: BleManager
     private lateinit var wsServer: HrWebSocketServer
     private var clientCount = 0
+    private val logPoster = Executors.newSingleThreadExecutor()
 
     var statusListener: ((String) -> Unit)? = null
     var hrListener: ((Int) -> Unit)? = null
@@ -36,7 +40,10 @@ class BleService : Service(), BleManager.HrListener {
         super.onCreate()
         createNotificationChannel()
         bleManager = BleManager(this, this).also { bm ->
-            bm.logListener = { line -> logListener?.invoke(line) }
+            bm.logListener = { line ->
+                logListener?.invoke(line)
+                postLog(line)
+            }
         }
         wsServer = HrWebSocketServer(8765).apply {
             onClientConnected = {
@@ -67,6 +74,21 @@ class BleService : Service(), BleManager.HrListener {
         bleManager.disconnect()
         wsServer.stop()
         super.onDestroy()
+    }
+
+    private fun postLog(line: String) {
+        logPoster.execute {
+            try {
+                val conn = URL("http://127.0.0.1:8090/api/bridge/log").openConnection() as HttpURLConnection
+                conn.requestMethod = "POST"
+                conn.doOutput = true
+                conn.setRequestProperty("Content-Type", "text/plain")
+                conn.outputStream.use { it.write(line.toByteArray()) }
+                conn.inputStream.close()
+            } catch (_: Exception) {
+                // server may be down; log still shows on screen
+            }
+        }
     }
 
     override fun onConnected() {
