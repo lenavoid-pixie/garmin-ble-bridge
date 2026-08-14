@@ -17,6 +17,8 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.util.UUID
 
 class BleManager(private val context: Context, private val listener: HrListener) {
@@ -30,19 +32,31 @@ class BleManager(private val context: Context, private val listener: HrListener)
 
     companion object {
         private const val TAG = "BleManager"
-        // Fallback only — scan is the primary path (Garmin HR broadcast can use a different address)
         const val GARMIN_ADDR = "E0:48:24:A1:A0:3E"
-        private val HR_SERVICE_UUID = UUID.fromString("0000180d-0000-1000-8000-00805f9b34fb")
-        private val HR_MEASUREMENT_UUID = UUID.fromString("00002a37-0000-1000-8000-00805f9b34fb")
+
+        // Garmin proprietary GFDI V2 protocol
+        private const val SERVICE_CODE = 0x2800
+        private const val RX_CODE = 0x2812
+        private const val TX_CODE = 0x2822
+        private const val REALTIME_HR = 6
+
         private val CCCD_UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+        private val HR_SERVICE_UUID = UUID.fromString("0000180d-0000-1000-8000-00805f9b34fb")
         private const val SCAN_TIMEOUT_MS = 20000L
+
+        private fun garminUuid(code: Int): UUID =
+            UUID.fromString(String.format("6a4e%04x-667b-11e3-949a-0800200c9a66", code))
+        private val SERVICE_UUID = garminUuid(SERVICE_CODE)
+        private val RX_UUID = garminUuid(RX_CODE)
+        private val TX_UUID = garminUuid(TX_CODE)
     }
 
     private var gatt: BluetoothGatt? = null
     private var scanner: BluetoothLeScanner? = null
     private var scanning = false
-    private val writeQueue = ArrayDeque<() -> Unit>()
-    private var writeInProgress = false
+    private var rxChar: BluetoothGattCharacteristic? = null
+    private var txChar: BluetoothGattCharacteristic? = null
+    private val handleToService = mutableMapOf<Int, Int>()
     private val handler = Handler(Looper.getMainLooper())
 
     var logListener: ((String) -> Unit)? = null
@@ -65,11 +79,8 @@ class BleManager(private val context: Context, private val listener: HrListener)
             listener.onError("Bluetooth scanner unavailable")
             return
         }
-        val settings = ScanSettings.Builder()
-            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
-            .build()
+        val settings = ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build()
         scanning = true
-        // No filter — we want to SEE everything and pick the HR advertiser ourselves.
         scanner!!.startScan(null, settings, scanCallback)
         log("Scanning (20s window)…")
         handler.postDelayed({
@@ -89,7 +100,7 @@ class BleManager(private val context: Context, private val listener: HrListener)
             val addr = result.device.address
             val uuids = result.scanRecord?.serviceUuids?.map { it.uuid } ?: emptyList()
             val hasHr = uuids.any { it == HR_SERVICE_UUID }
-            log("Seen: $name @ $addr — HRservice=$hasHr uuids=${uuids.take(6)}")
+            log("Seen: $name @ $addr — HRservice=$hasHr")
             if (!hasHr) return
             if (!scanning) return
             scanning = false
@@ -125,17 +136,6 @@ class BleManager(private val context: Context, private val listener: HrListener)
         gatt = null
     }
 
-    private fun enqueueWrite(action: () -> Unit) {
-        writeQueue.add(action)
-        if (!writeInProgress) executeNext()
-    }
-
-    private fun executeNext() {
-        if (writeQueue.isEmpty()) { writeInProgress = false; return }
-        writeInProgress = true
-        writeQueue.removeFirst().invoke()
-    }
-
     @Suppress("DEPRECATION")
     private val gattCallback = object : BluetoothGattCallback() {
 
@@ -159,105 +159,140 @@ class BleManager(private val context: Context, private val listener: HrListener)
                 listener.onError("Service discovery failed (status=$status)")
                 return
             }
-            val hrChar = gatt.getService(HR_SERVICE_UUID)?.getCharacteristic(HR_MEASUREMENT_UUID)
-            log("Services discovered. HR service present=${hrChar != null}. Full list:")
-            for (service in gatt.services) {
-                for (char in service.characteristics) {
-                    log("  svc=${service.uuid} char=${char.uuid}")
-                }
-            }
-            if (hrChar == null) {
-                log("HR service NOT found — is Broadcast HR on?")
-                listener.onError("HR service not found. Enable heart rate broadcast mode on the watch.")
+            rxChar = gatt.getService(SERVICE_UUID)?.getCharacteristic(RX_UUID)
+            txChar = gatt.getService(SERVICE_UUID)?.getCharacteristic(TX_UUID)
+            val hrPresent = gatt.getService(HR_SERVICE_UUID) != null
+            log("Services discovered. RX=${rxChar != null} TX=${txChar != null} HRservice=$hrPresent")
+            if (rxChar == null || txChar == null) {
+                log("Garmin proprietary chars NOT found")
+                listener.onError("Garmin proprietary characteristic not found")
                 return
             }
-
-            // Enable notifications/indications on every CCCD we can find (covers Garmin proprietary too).
-            for (service in gatt.services) {
-                for (char in service.characteristics) {
-                    val cccd = char.getDescriptor(CCCD_UUID) ?: continue
-                    gatt.setCharacteristicNotification(char, true)
-                    val isHr = char.uuid == HR_MEASUREMENT_UUID
-                    log("Subscribing: char=${char.uuid} isHR=$isHr")
-                    enqueueWrite {
-                        @Suppress("DEPRECATION")
-                        cccd.value = if (isHr) byteArrayOf(0x03, 0x00) else BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                        @Suppress("DEPRECATION")
-                        gatt.writeDescriptor(cccd)
-                    }
-                }
+            // Subscribe to the Garmin RX characteristic (data flows here, not 0x2A37).
+            val cccd = rxChar!!.getDescriptor(CCCD_UUID)
+            if (cccd == null) {
+                log("RX CCCD missing")
+                listener.onError("RX CCCD missing")
+                return
             }
+            gatt.setCharacteristicNotification(rxChar, true)
+            @Suppress("DEPRECATION")
+            cccd.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+            @Suppress("DEPRECATION")
+            gatt.writeDescriptor(cccd)
+            log("Subscribing to Garmin RX char…")
         }
 
         override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
-            val uuid = descriptor.characteristic?.uuid
-            log("Descriptor write: char=$uuid status=$status")
-            if (uuid == HR_MEASUREMENT_UUID) {
+            log("Descriptor write: char=${descriptor.characteristic?.uuid} status=$status")
+            if (descriptor.characteristic?.uuid == RX_UUID) {
                 if (status == BluetoothGatt.GATT_SUCCESS) {
-                    log("HR notifications enabled — waiting for data…")
+                    log("RX subscribed — starting Garmin handshake…")
                     listener.onConnected()
+                    startHandshake()
                 } else {
-                    listener.onError("Failed to enable HR notifications (status=$status)")
+                    listener.onError("Failed to enable RX notifications (status=$status)")
                 }
             }
-            executeNext()
         }
 
-        // API 33+
         override fun onCharacteristicChanged(
             gatt: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic,
             value: ByteArray
         ) {
-            log("CHAR CHANGED (api33): uuid=${characteristic.uuid} bytes=${value.joinToString(":") { "%02x".format(it) }}")
-            if (characteristic.uuid == HR_MEASUREMENT_UUID) handleHrValue(value)
+            if (characteristic.uuid == RX_UUID) {
+                onRxData(value)
+            }
         }
 
-        // API 32 and below
         @Deprecated("Deprecated in API 33")
         override fun onCharacteristicChanged(
             gatt: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic
         ) {
-            log("CHAR CHANGED (legacy): uuid=${characteristic.uuid}")
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
-                if (characteristic.uuid == HR_MEASUREMENT_UUID) handleHrValue(characteristic.value)
+                if (characteristic.uuid == RX_UUID) onRxData(characteristic.value)
             }
         }
     }
 
-    private fun handleHrValue(value: ByteArray) {
-        val (hr, rr) = parseHrMeasurement(value)
-        log("Parsed HR=$hr rr=$rr")
-        if (hr in 30..220) listener.onHrData(hr, rr)
-        else log("HR out of range ($hr) — ignored")
+    // ── Garmin GFDI V2 handshake + decode ───────────────────────────────────
+
+    private fun startHandshake() {
+        val tx = txChar ?: return
+        handler.postDelayed({ writeNoResponse(tx, buildCloseAllRequest()) }, 150)
+        handler.postDelayed({ writeNoResponse(tx, buildRegisterMlRequest(REALTIME_HR)) }, 500)
+        log("Handshake sent: CLOSE_ALL + REGISTER_ML(HR)")
     }
 
-    private fun parseHrMeasurement(value: ByteArray): Pair<Int, List<Int>> {
-        if (value.isEmpty()) return Pair(0, emptyList())
-        val flags = value[0].toInt() and 0xFF
-        var offset = 1
+    private fun buildCloseAllRequest(): ByteArray {
+        val bb = ByteBuffer.allocate(13).order(ByteOrder.LITTLE_ENDIAN)
+        bb.put(0)            // control handle 0
+        bb.put(5)            // CLOSE_ALL_REQ
+        bb.putLong(0)        // q = 0
+        bb.putShort(2)       // h = CLIENT_ID = 2
+        bb.put(0)            // b = 0
+        return bb.array()
+    }
 
-        val hr = if (flags and 0x01 != 0) {
-            val v = ((value[offset + 1].toInt() and 0xFF) shl 8) or (value[offset].toInt() and 0xFF)
-            offset += 2; v
+    private fun buildRegisterMlRequest(service: Int): ByteArray {
+        val bb = ByteBuffer.allocate(13).order(ByteOrder.LITTLE_ENDIAN)
+        bb.put(0)                  // control handle 0
+        bb.put(0)                  // REGISTER_ML_REQ
+        bb.putLong(2)              // q = CLIENT_ID = 2
+        bb.putShort(service.toShort()) // h = service code
+        bb.put(0)                  // b = 0
+        return bb.array()
+    }
+
+    @SuppressLint("MissingPermission")
+    @Suppress("DEPRECATION")
+    private fun writeNoResponse(char: BluetoothGattCharacteristic, data: ByteArray) {
+        char.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+        char.value = data
+        val ok = gatt?.writeCharacteristic(char) ?: false
+        log("TX write (${data.size} bytes) ok=$ok")
+    }
+
+    private fun onRxData(value: ByteArray) {
+        if (value.isEmpty()) return
+        val b0 = value[0].toInt() and 0xFF
+        if (b0 and 0x80 != 0) {
+            val handle = (b0 and 0x70) shr 4
+            route(handle, value)
+        } else if (b0 == 0) {
+            // control channel
+            if (value.size >= 14 && (value[1].toInt() and 0xFF) == 1) {
+                val service = (value[10].toInt() and 0xFF) or ((value[11].toInt() and 0xFF) shl 8)
+                val st = value[12].toInt() and 0xFF
+                val handle = value[13].toInt() and 0xFF
+                if (st == 0) {
+                    handleToService[handle] = service
+                    log("REGISTER_ML_RESP: service=$service -> handle=$handle")
+                } else {
+                    log("REGISTER_ML_RESP refused: service=$service status=$st")
+                }
+            } else if (value.size >= 2) {
+                log("Control msg type=${value[1].toInt() and 0xFF}")
+            }
         } else {
-            val v = value[offset].toInt() and 0xFF
-            offset += 1; v
+            route(b0, value)
         }
+    }
 
-        if (flags and 0x08 != 0) offset += 2 // energy expended
-
-        val rrIntervals = mutableListOf<Int>()
-        if (flags and 0x10 != 0) {
-            while (offset + 1 < value.size) {
-                val raw = ((value[offset + 1].toInt() and 0xFF) shl 8) or (value[offset].toInt() and 0xFF)
-                val rrMs = raw * 1000 / 1024
-                if (rrMs in 300..2000) rrIntervals.add(rrMs)
-                offset += 2
+    private fun route(handle: Int, value: ByteArray) {
+        val service = handleToService[handle] ?: return
+        when (service) {
+            REALTIME_HR -> {
+                if (value.size >= 4) {
+                    val hr = value[2].toInt() and 0xFF   // value[0]=routing, value[1]=pad, value[2]=hr
+                    val resting = value[3].toInt() and 0xFF
+                    log("❤️ HR=$hr bpm (resting=$resting)")
+                    if (hr in 30..220) listener.onHrData(hr, emptyList())
+                }
             }
+            else -> log("route: unknown service=$service handle=$handle hex=${value.joinToString(":"){"%02x".format(it)}}")
         }
-
-        return Pair(hr, rrIntervals)
     }
 }
