@@ -38,7 +38,11 @@ class BleManager(private val context: Context, private val listener: HrListener)
         private const val SERVICE_CODE = 0x2800
         private const val RX_CODE = 0x2812
         private const val TX_CODE = 0x2822
+        private const val GFDI = 1
         private const val REALTIME_HR = 6
+
+        private const val RESP_REGISTER_ML = 1
+        private const val RESP_CLOSE_ALL = 6
 
         private val CCCD_UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
         private val HR_SERVICE_UUID = UUID.fromString("0000180d-0000-1000-8000-00805f9b34fb")
@@ -168,7 +172,6 @@ class BleManager(private val context: Context, private val listener: HrListener)
                 listener.onError("Garmin proprietary characteristic not found")
                 return
             }
-            // Subscribe to the Garmin RX characteristic (data flows here, not 0x2A37).
             val cccd = rxChar!!.getDescriptor(CCCD_UUID)
             if (cccd == null) {
                 log("RX CCCD missing")
@@ -201,9 +204,7 @@ class BleManager(private val context: Context, private val listener: HrListener)
             characteristic: BluetoothGattCharacteristic,
             value: ByteArray
         ) {
-            if (characteristic.uuid == RX_UUID) {
-                onRxData(value)
-            }
+            if (characteristic.uuid == RX_UUID) onRxData(value)
         }
 
         @Deprecated("Deprecated in API 33")
@@ -219,11 +220,11 @@ class BleManager(private val context: Context, private val listener: HrListener)
 
     // ── Garmin GFDI V2 handshake + decode ───────────────────────────────────
 
+    // Handshake order (from garmin-ble reference): CLOSE_ALL → register GFDI(1) → register HR(6) → start(0x01)
     private fun startHandshake() {
         val tx = txChar ?: return
-        handler.postDelayed({ writeNoResponse(tx, buildCloseAllRequest()) }, 150)
-        handler.postDelayed({ writeNoResponse(tx, buildRegisterMlRequest(REALTIME_HR)) }, 500)
-        log("Handshake sent: CLOSE_ALL + REGISTER_ML(HR)")
+        log("Handshake: CLOSE_ALL")
+        writeNoResponse(tx, buildCloseAllRequest())
     }
 
     private fun buildCloseAllRequest(): ByteArray {
@@ -255,6 +256,12 @@ class BleManager(private val context: Context, private val listener: HrListener)
         log("TX write (${data.size} bytes) ok=$ok")
     }
 
+    private fun startService(handle: Int) {
+        val tx = txChar ?: return
+        writeNoResponse(tx, byteArrayOf(handle.toByte(), 0x01))
+        log("Start command sent on handle $handle")
+    }
+
     private fun onRxData(value: ByteArray) {
         if (value.isEmpty()) return
         val b0 = value[0].toInt() and 0xFF
@@ -262,19 +269,36 @@ class BleManager(private val context: Context, private val listener: HrListener)
             val handle = (b0 and 0x70) shr 4
             route(handle, value)
         } else if (b0 == 0) {
-            // control channel
-            if (value.size >= 14 && (value[1].toInt() and 0xFF) == 1) {
-                val service = (value[10].toInt() and 0xFF) or ((value[11].toInt() and 0xFF) shl 8)
-                val st = value[12].toInt() and 0xFF
-                val handle = value[13].toInt() and 0xFF
-                if (st == 0) {
-                    handleToService[handle] = service
-                    log("REGISTER_ML_RESP: service=$service -> handle=$handle")
-                } else {
-                    log("REGISTER_ML_RESP refused: service=$service status=$st")
+            if (value.size < 2) return
+            when (value[1].toInt() and 0xFF) {
+                RESP_CLOSE_ALL -> {
+                    log("CLOSE_ALL accepted — registering GFDI(1)")
+                    writeNoResponse(txChar!!, buildRegisterMlRequest(GFDI))
                 }
-            } else if (value.size >= 2) {
-                log("Control msg type=${value[1].toInt() and 0xFF}")
+                RESP_REGISTER_ML -> {
+                    if (value.size >= 14) {
+                        val service = (value[10].toInt() and 0xFF) or ((value[11].toInt() and 0xFF) shl 8)
+                        val st = value[12].toInt() and 0xFF
+                        val handle = value[13].toInt() and 0xFF
+                        if (st == 0) {
+                            handleToService[handle] = service
+                            log("REGISTER_ML_RESP: service=$service -> handle=$handle")
+                            when (service) {
+                                GFDI -> {
+                                    log("GFDI open — registering HR(6)")
+                                    writeNoResponse(txChar!!, buildRegisterMlRequest(REALTIME_HR))
+                                }
+                                REALTIME_HR -> {
+                                    log("HR registered — starting stream on handle $handle")
+                                    startService(handle)
+                                }
+                            }
+                        } else {
+                            log("REGISTER_ML_RESP refused: service=$service status=$st")
+                        }
+                    }
+                }
+                else -> log("Control msg type=${value[1].toInt() and 0xFF}")
             }
         } else {
             route(b0, value)
@@ -285,9 +309,10 @@ class BleManager(private val context: Context, private val listener: HrListener)
         val service = handleToService[handle] ?: return
         when (service) {
             REALTIME_HR -> {
-                if (value.size >= 4) {
-                    val hr = value[2].toInt() and 0xFF   // value[0]=routing, value[1]=pad, value[2]=hr
-                    val resting = value[3].toInt() and 0xFF
+                // wire format after routing byte: [padding, hr, resting_hr]; bpm = value[2]
+                if (value.size >= 3) {
+                    val hr = value[2].toInt() and 0xFF
+                    val resting = if (value.size >= 4) value[3].toInt() and 0xFF else 0
                     log("❤️ HR=$hr bpm (resting=$resting)")
                     if (hr in 30..220) listener.onHrData(hr, emptyList())
                 }
