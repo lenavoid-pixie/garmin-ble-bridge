@@ -94,7 +94,7 @@ class BleManager(private val context: Context, private val listener: HrListener)
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             if (!scanning) return
             scanning = false
-            try { scanner?.stopScan(scanCallback) } catch (_: Exception) {}
+            try { scanner?.stopScan(this) } catch (_: Exception) {}
             val device = result.device
             Log.d(TAG, "Found HR device: ${device.address} name=${device.name}")
             gatt = device.connectGatt(context, false, gattCallback)
